@@ -29,43 +29,96 @@ function log(scope: string, payload?: unknown) {
   console.log(`[${ts}] ${scope}`, payload);
 }
 
-function safeStatus(v: unknown) {
-  const status = asString(v).toUpperCase();
+function isSafeNearAccountId(accountId: string) {
+  const value = accountId.trim().toLowerCase();
 
-  const allowed = new Set([
-    "QUOTE_CREATED",
-    "PENDING",
-    "SUBMITTED",
-    "PROCESSING",
-    "SUCCESS",
-    "COMPLETED",
-    "FAILED",
-    "ERROR",
-    "EXPIRED",
-  ]);
+  if (!value) return false;
+  if (value.length < 2 || value.length > 64) return false;
+  if (value.includes("attacker")) return false;
+  if (value.includes("test_user")) return false;
+  if (value.includes("security_test")) return false;
 
-  return allowed.has(status) ? status : "PENDING";
+  // NEAR implicit accounts are 64 lowercase hex chars.
+  if (/^[a-f0-9]{64}$/.test(value)) return true;
+
+  // Named NEAR accounts: basic validation good enough for API input filtering.
+  return /^[a-z0-9]+(?:[._-][a-z0-9]+)*\.(near|testnet)$/.test(value);
 }
 
-function safeDirection(v: unknown) {
-  const direction = asString(v).toUpperCase();
+function isSafeAmountString(amount: string) {
+  const value = amount.trim();
+  if (!value) return false;
+  if (!/^\d+$/.test(value)) return false;
 
-  const allowed = new Set([
-    "TO_NEAR",
-    "FROM_NEAR",
-    "NEAR_TO_SOL",
-    "SOL_TO_NEAR",
-  ]);
-
-  return allowed.has(direction) ? direction : "TO_NEAR";
+  try {
+    return BigInt(value) > 0n;
+  } catch {
+    return false;
+  }
 }
 
-function safeAsset(v: unknown) {
-  const asset = asString(v).toUpperCase();
+function normalizeDbStatus(status: unknown) {
+  const rawStatus = asString(status).toUpperCase();
 
-  const allowed = new Set(["NEAR", "SOL", "USDC", "ETH", "BTC"]);
+  if (["SUCCESS", "COMPLETED", "FILLED"].includes(rawStatus)) {
+    return "SUCCESS";
+  }
 
-  return allowed.has(asset) ? asset : "SOL";
+  if (["FAILED", "ERROR", "EXPIRED", "REFUNDED", "INCOMPLETE_DEPOSIT"].includes(rawStatus)) {
+    return "FAILED";
+  }
+
+  if (["SUBMITTED", "PROCESSING", "PENDING", "WAITING_DEPOSIT", "WAITING"].includes(rawStatus)) {
+    return rawStatus === "SUBMITTED" ? "SUBMITTED" : "PROCESSING";
+  }
+
+  return "PROCESSING";
+}
+
+function assetLabelFromOriginAsset(originAsset: string) {
+  const value = originAsset.toLowerCase();
+  if (value.includes("sol")) return "SOL";
+  if (value.includes("usdc")) return "USDC";
+  if (value.includes("eth")) return "ETH";
+  if (value.includes("btc")) return "BTC";
+  if (value.includes("near")) return "NEAR";
+  return "SOL";
+}
+
+function pickQuoteDepositAddress(quote: any) {
+  return (
+    asNullableString(quote?.depositAddress) ||
+    asNullableString(quote?.deposit_address) ||
+    asNullableString(quote?.deposit?.address)
+  );
+}
+
+function pickQuoteAmountOut(quote: any) {
+  return (
+    asNullableString(quote?.amountOut) ||
+    asNullableString(quote?.amount_out) ||
+    asNullableString(quote?.minAmountOut) ||
+    asNullableString(quote?.min_amount_out) ||
+    asNullableString(quote?.expectedAmountOut) ||
+    asNullableString(quote?.expected_amount_out)
+  );
+}
+
+function pickStatusDestinationTxHash(result: any) {
+  return (
+    asNullableString(result?.destinationTxHash) ||
+    asNullableString(result?.destination_tx_hash) ||
+    asNullableString(result?.transferTxHash) ||
+    asNullableString(result?.transfer_tx_hash) ||
+    asNullableString(result?.txHash) ||
+    asNullableString(result?.tx_hash) ||
+    asNullableString(result?.data?.destinationTxHash) ||
+    asNullableString(result?.data?.destination_tx_hash) ||
+    asNullableString(result?.data?.transferTxHash) ||
+    asNullableString(result?.data?.transfer_tx_hash) ||
+    asNullableString(result?.data?.txHash) ||
+    asNullableString(result?.data?.tx_hash)
+  );
 }
 
 router.get("/tokens", async (_req, res) => {
@@ -118,6 +171,18 @@ router.post("/quote", async (req, res) => {
       });
     }
 
+    if (!isSafeNearAccountId(nearAccountId)) {
+      return res.status(400).json({
+        error: "Invalid nearAccountId",
+      });
+    }
+
+    if (!isSafeAmountString(amount)) {
+      return res.status(400).json({
+        error: "Invalid amount",
+      });
+    }
+
     const deadline = new Date(Date.now() + 10 * 60 * 1000).toISOString();
 
     const payload = {
@@ -140,19 +205,64 @@ router.post("/quote", async (req, res) => {
 
     const result = await create1ClickQuote(payload);
     const quote = result?.quote ?? null;
+    const depositAddress = pickQuoteDepositAddress(quote);
+    const quoteAmountOut = pickQuoteAmountOut(quote);
+
+    if (!quote || !depositAddress) {
+      return res.status(502).json({
+        error: "1Click quote did not return a deposit address",
+        quote,
+        correlationId: result?.correlationId ?? null,
+      });
+    }
+
+    const { data: transaction, error: insertError } = await supabaseAdmin
+      .from(SWAP_TABLE)
+      .insert({
+        account_id: nearAccountId,
+        direction: "TO_NEAR",
+        asset: assetLabelFromOriginAsset(originAsset),
+        amount,
+        status: "PENDING",
+        deposit_address: depositAddress,
+        destination_address: nearAccountId,
+        refund_address: refundTo,
+        near_tx_hash: null,
+        destination_tx_hash: null,
+        quote_amount_out: quoteAmountOut,
+        quote_expiry: deadline,
+        error: null,
+        meta: {
+          source: "render-backend",
+          createdBy: "quote",
+          originAsset,
+          destinationAsset: "nep141:wrap.near",
+          slippageTolerance: payload.slippageTolerance,
+          correlationId: result?.correlationId ?? null,
+          quoteRequest: result?.quoteRequest ?? null,
+        },
+      })
+      .select("*")
+      .single();
+
+    if (insertError) {
+      throw insertError;
+    }
 
     log("SWAP QUOTE RESPONSE", {
       nearAccountId,
       originAsset,
       amount,
-      depositAddress: quote?.depositAddress || null,
-      amountOut: quote?.amountOut || null,
+      depositAddress,
+      amountOut: quoteAmountOut,
+      transactionId: transaction?.id || null,
       result,
     });
 
     return res.json({
       ok: true,
       quote,
+      transaction,
       quoteRequest: result?.quoteRequest ?? null,
       signature: result?.signature ?? null,
       timestamp: result?.timestamp ?? null,
@@ -161,6 +271,9 @@ router.post("/quote", async (req, res) => {
   } catch (err: any) {
     console.error("SWAP QUOTE ERROR:", {
       message: err?.message,
+      details: err?.details,
+      hint: err?.hint,
+      code: err?.code,
       stack: err?.stack,
       name: err?.name,
     });
@@ -171,145 +284,20 @@ router.post("/quote", async (req, res) => {
   }
 });
 
-router.post("/transactions/create", async (req, res) => {
-  try {
-    const account_id = asString(req.body?.account_id || req.body?.accountId);
-    const direction = safeDirection(req.body?.direction);
-    const asset = safeAsset(req.body?.asset);
-    const amount = asString(req.body?.amount);
-    const deposit_address = asNullableString(
-      req.body?.deposit_address || req.body?.depositAddress
-    );
-    const destination_address = asNullableString(
-      req.body?.destination_address || req.body?.destinationAddress
-    );
-    const refund_address = asNullableString(
-      req.body?.refund_address || req.body?.refundAddress
-    );
-    const quote_amount_out = asNullableString(
-      req.body?.quote_amount_out || req.body?.quoteAmountOut
-    );
-    const quote_expiry = asNullableString(
-      req.body?.quote_expiry || req.body?.quoteExpiry
-    );
-
-    if (!account_id || !amount) {
-      return res.status(400).json({
-        error: "account_id and amount are required",
-      });
-    }
-
-    if (account_id.toLowerCase().includes("attacker")) {
-      return res.status(400).json({
-        error: "Invalid account_id",
-      });
-    }
-
-    const insertPayload = {
-      account_id,
-      direction,
-      asset,
-      amount,
-      status: "PENDING",
-      deposit_address,
-      destination_address,
-      refund_address,
-      near_tx_hash: null,
-      destination_tx_hash: null,
-      quote_amount_out,
-      quote_expiry,
-      error: null,
-      meta: {
-        source: "render-backend",
-        createdBy: "api",
-      },
-    };
-
-    const { data, error } = await supabaseAdmin
-      .from(SWAP_TABLE)
-      .insert(insertPayload)
-      .select("*")
-      .single();
-
-    if (error) {
-      throw error;
-    }
-
-    return res.json({
-      ok: true,
-      transaction: data,
-    });
-  } catch (err: any) {
-    console.error("SWAP TRANSACTION CREATE ERROR:", {
-      message: err?.message,
-      details: err?.details,
-      hint: err?.hint,
-      code: err?.code,
-    });
-
-    return res.status(500).json({
-      error: err?.message || "Failed to create swap transaction",
-    });
-  }
+// Intentionally disabled. Database rows must be created from /quote only,
+// after the backend receives a real 1Click quote.
+router.post("/transactions/create", async (_req, res) => {
+  return res.status(410).json({
+    error: "This endpoint is disabled. Create swap records through /api/swap/quote.",
+  });
 });
 
-router.post("/transactions/update", async (req, res) => {
-  try {
-    const id = asString(req.body?.id);
-    const account_id = asString(req.body?.account_id || req.body?.accountId);
-
-    if (!id || !account_id) {
-      return res.status(400).json({
-        error: "id and account_id are required",
-      });
-    }
-
-    const status = safeStatus(req.body?.status);
-    const near_tx_hash = asNullableString(
-      req.body?.near_tx_hash || req.body?.nearTxHash
-    );
-    const destination_tx_hash = asNullableString(
-      req.body?.destination_tx_hash || req.body?.destinationTxHash
-    );
-    const error_message = asNullableString(req.body?.error);
-
-    const updatePayload: Record<string, unknown> = {
-      status,
-      updated_at: new Date().toISOString(),
-    };
-
-    if (near_tx_hash) updatePayload.near_tx_hash = near_tx_hash;
-    if (destination_tx_hash) updatePayload.destination_tx_hash = destination_tx_hash;
-    if (error_message) updatePayload.error = error_message;
-
-    const { data, error } = await supabaseAdmin
-      .from(SWAP_TABLE)
-      .update(updatePayload)
-      .eq("id", id)
-      .eq("account_id", account_id)
-      .select("*")
-      .single();
-
-    if (error) {
-      throw error;
-    }
-
-    return res.json({
-      ok: true,
-      transaction: data,
-    });
-  } catch (err: any) {
-    console.error("SWAP TRANSACTION UPDATE ERROR:", {
-      message: err?.message,
-      details: err?.details,
-      hint: err?.hint,
-      code: err?.code,
-    });
-
-    return res.status(500).json({
-      error: err?.message || "Failed to update swap transaction",
-    });
-  }
+// Intentionally disabled. Status updates must come from /deposit-submit or /status,
+// where the backend checks the 1Click flow first.
+router.post("/transactions/update", async (_req, res) => {
+  return res.status(410).json({
+    error: "This endpoint is disabled. Swap records are updated through verified swap status routes.",
+  });
 });
 
 router.get("/transactions/history", async (req, res) => {
@@ -324,6 +312,12 @@ router.get("/transactions/history", async (req, res) => {
     if (!account_id) {
       return res.status(400).json({
         error: "account_id is required",
+      });
+    }
+
+    if (!isSafeNearAccountId(account_id)) {
+      return res.status(400).json({
+        error: "Invalid account_id",
       });
     }
 
@@ -383,22 +377,44 @@ router.post("/deposit-submit", async (req, res) => {
     });
 
     if (transactionId && accountId) {
-      const { error } = await supabaseAdmin
+      const { data: existing, error: lookupError } = await supabaseAdmin
         .from(SWAP_TABLE)
-        .update({
-          status: "SUBMITTED",
-          near_tx_hash: txHash,
-          updated_at: new Date().toISOString(),
-          meta: {
-            source: "render-backend",
-            depositSubmitResult: result,
-          },
-        })
+        .select("id, account_id, deposit_address, meta")
         .eq("id", transactionId)
-        .eq("account_id", accountId);
+        .eq("account_id", accountId)
+        .eq("deposit_address", depositAddress)
+        .maybeSingle();
 
-      if (error) {
-        console.error("SWAP DEPOSIT_SUBMIT DB UPDATE ERROR:", error);
+      if (lookupError) {
+        console.error("SWAP DEPOSIT_SUBMIT DB LOOKUP ERROR:", lookupError);
+      }
+
+      if (existing) {
+        const { error } = await supabaseAdmin
+          .from(SWAP_TABLE)
+          .update({
+            status: "SUBMITTED",
+            near_tx_hash: txHash,
+            updated_at: new Date().toISOString(),
+            meta: {
+              ...(typeof existing.meta === "object" && existing.meta ? existing.meta : {}),
+              source: "render-backend",
+              depositSubmitResult: result,
+            },
+          })
+          .eq("id", transactionId)
+          .eq("account_id", accountId)
+          .eq("deposit_address", depositAddress);
+
+        if (error) {
+          console.error("SWAP DEPOSIT_SUBMIT DB UPDATE ERROR:", error);
+        }
+      } else {
+        console.warn("SWAP DEPOSIT_SUBMIT DB UPDATE SKIPPED: no matching transaction", {
+          transactionId,
+          accountId,
+          depositAddress,
+        });
       }
     }
 
@@ -444,38 +460,54 @@ router.get("/status", async (req, res) => {
     }
 
     const result = await fetch1ClickStatus(depositAddress);
-    const rawStatus = asString(result?.status).toUpperCase();
-
-    let dbStatus = "PROCESSING";
-    if (["SUCCESS", "COMPLETED", "FILLED"].includes(rawStatus)) {
-      dbStatus = "SUCCESS";
-    } else if (["FAILED", "ERROR", "EXPIRED", "REFUNDED"].includes(rawStatus)) {
-      dbStatus = "FAILED";
-    }
+    const dbStatus = normalizeDbStatus(result?.status);
 
     if (transactionId && accountId) {
-      const destinationTxHash =
-        asNullableString(result?.destinationTxHash) ||
-        asNullableString(result?.destination_tx_hash) ||
-        asNullableString(result?.txHash) ||
-        asNullableString(result?.tx_hash);
-
-      const { error } = await supabaseAdmin
+      const { data: existing, error: lookupError } = await supabaseAdmin
         .from(SWAP_TABLE)
-        .update({
+        .select("id, account_id, deposit_address, meta")
+        .eq("id", transactionId)
+        .eq("account_id", accountId)
+        .eq("deposit_address", depositAddress)
+        .maybeSingle();
+
+      if (lookupError) {
+        console.error("SWAP STATUS DB LOOKUP ERROR:", lookupError);
+      }
+
+      if (existing) {
+        const destinationTxHash = pickStatusDestinationTxHash(result);
+
+        const updatePayload: Record<string, unknown> = {
           status: dbStatus,
-          destination_tx_hash: destinationTxHash,
           updated_at: new Date().toISOString(),
           meta: {
+            ...(typeof existing.meta === "object" && existing.meta ? existing.meta : {}),
             source: "render-backend",
             lastStatusResult: result,
           },
-        })
-        .eq("id", transactionId)
-        .eq("account_id", accountId);
+        };
 
-      if (error) {
-        console.error("SWAP STATUS DB UPDATE ERROR:", error);
+        if (destinationTxHash) {
+          updatePayload.destination_tx_hash = destinationTxHash;
+        }
+
+        const { error } = await supabaseAdmin
+          .from(SWAP_TABLE)
+          .update(updatePayload)
+          .eq("id", transactionId)
+          .eq("account_id", accountId)
+          .eq("deposit_address", depositAddress);
+
+        if (error) {
+          console.error("SWAP STATUS DB UPDATE ERROR:", error);
+        }
+      } else {
+        console.warn("SWAP STATUS DB UPDATE SKIPPED: no matching transaction", {
+          transactionId,
+          accountId,
+          depositAddress,
+        });
       }
     }
 
