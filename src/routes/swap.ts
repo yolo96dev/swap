@@ -85,6 +85,28 @@ function assetLabelFromOriginAsset(originAsset: string) {
   return "SOL";
 }
 
+function destinationAssetFromAssetOut(assetOut: string) {
+  const value = assetOut.trim().toUpperCase();
+
+  if (value === "SOL") return "nep141:sol.omft.near";
+  if (value === "USDC") return "nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near";
+  if (value === "BTC") return "nep141:btc.omft.near";
+  if (value === "ETH") return "nep141:eth.omft.near";
+
+  return "";
+}
+
+function atomicToDecimalString(value: string, decimals: number) {
+  const raw = value.replace(/[^\d]/g, "") || "0";
+  if (decimals <= 0) return raw;
+
+  const padded = raw.padStart(decimals + 1, "0");
+  const whole = padded.slice(0, -decimals) || "0";
+  const frac = padded.slice(-decimals).replace(/0+$/, "");
+
+  return frac ? `${whole}.${frac}` : whole;
+}
+
 function pickQuoteDepositAddress(quote: any) {
   return (
     asNullableString(quote?.depositAddress) ||
@@ -280,6 +302,158 @@ router.post("/quote", async (req, res) => {
 
     return res.status(500).json({
       error: err?.message || "Failed to create swap quote",
+    });
+  }
+});
+
+router.post("/swap-out/quote", async (req, res) => {
+  try {
+    const nearAccountId = asString(req.body?.nearAccountId || req.body?.accountId);
+    const assetOut = asString(req.body?.assetOut || req.body?.asset);
+    const amount = asString(req.body?.amount);
+    const destinationAddress = asString(req.body?.destinationAddress || req.body?.recipient);
+    const slippageTolerance = Number(req.body?.slippageTolerance ?? 100);
+
+    log("SWAP_OUT QUOTE REQUEST", {
+      nearAccountId,
+      assetOut,
+      amount,
+      destinationAddress,
+      slippageTolerance,
+      rawBody: req.body,
+    });
+
+    if (!nearAccountId || !assetOut || !amount || !destinationAddress) {
+      return res.status(400).json({
+        error: "nearAccountId, assetOut, amount, and destinationAddress are required",
+      });
+    }
+
+    if (!isSafeNearAccountId(nearAccountId)) {
+      return res.status(400).json({
+        error: "Invalid nearAccountId",
+      });
+    }
+
+    if (!isSafeAmountString(amount)) {
+      return res.status(400).json({
+        error: "Invalid amount",
+      });
+    }
+
+    const destinationAsset = destinationAssetFromAssetOut(assetOut);
+
+    if (!destinationAsset) {
+      return res.status(400).json({
+        error: "Unsupported assetOut",
+      });
+    }
+
+    if (destinationAddress.length < 12 || destinationAddress.length > 180) {
+      return res.status(400).json({
+        error: "Invalid destinationAddress",
+      });
+    }
+
+    const deadline = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+
+    const payload = {
+      dry: false,
+      swapType: "EXACT_INPUT" as const,
+      slippageTolerance:
+        Number.isFinite(slippageTolerance) && slippageTolerance > 0
+          ? Math.trunc(slippageTolerance)
+          : 100,
+      originAsset: "nep141:wrap.near",
+      depositType: "ORIGIN_CHAIN" as const,
+      destinationAsset,
+      amount,
+      recipient: destinationAddress,
+      recipientType: "DESTINATION_CHAIN" as const,
+      refundTo: nearAccountId,
+      refundType: "ORIGIN_CHAIN" as const,
+      deadline,
+    };
+
+    const result = await create1ClickQuote(payload);
+    const quote = result?.quote ?? null;
+    const depositAddress = pickQuoteDepositAddress(quote);
+    const quoteAmountOut = pickQuoteAmountOut(quote);
+
+    if (!quote || !depositAddress) {
+      return res.status(502).json({
+        error: "1Click swap-out quote did not return a deposit address",
+        quote,
+        correlationId: result?.correlationId ?? null,
+      });
+    }
+
+    const asset = assetOut.trim().toUpperCase();
+
+    const { data: transaction, error: insertError } = await supabaseAdmin
+      .from(SWAP_TABLE)
+      .insert({
+        account_id: nearAccountId,
+        direction: "FROM_NEAR",
+        asset,
+        amount: atomicToDecimalString(amount, 24),
+        status: "PENDING",
+        deposit_address: depositAddress,
+        destination_address: destinationAddress,
+        refund_address: nearAccountId,
+        near_tx_hash: null,
+        destination_tx_hash: null,
+        quote_amount_out: quoteAmountOut,
+        quote_expiry: deadline,
+        error: null,
+        meta: {
+          source: "render-backend",
+          createdBy: "swap-out-quote",
+          originAsset: "nep141:wrap.near",
+          destinationAsset,
+          slippageTolerance: payload.slippageTolerance,
+          correlationId: result?.correlationId ?? null,
+          quoteRequest: result?.quoteRequest ?? null,
+        },
+      })
+      .select("*")
+      .single();
+
+    if (insertError) {
+      throw insertError;
+    }
+
+    log("SWAP_OUT QUOTE RESPONSE", {
+      nearAccountId,
+      assetOut: asset,
+      amount,
+      depositAddress,
+      amountOut: quoteAmountOut,
+      transactionId: transaction?.id || null,
+      result,
+    });
+
+    return res.json({
+      ok: true,
+      quote,
+      transaction,
+      quoteRequest: result?.quoteRequest ?? null,
+      signature: result?.signature ?? null,
+      timestamp: result?.timestamp ?? null,
+      correlationId: result?.correlationId ?? null,
+    });
+  } catch (err: any) {
+    console.error("SWAP_OUT QUOTE ERROR:", {
+      message: err?.message,
+      details: err?.details,
+      hint: err?.hint,
+      code: err?.code,
+      stack: err?.stack,
+      name: err?.name,
+    });
+
+    return res.status(500).json({
+      error: err?.message || "Failed to create swap-out quote",
     });
   }
 });
